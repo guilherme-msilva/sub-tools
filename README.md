@@ -1,7 +1,7 @@
 # ⬡ Sub-Tools
 
 > **Automatic subtitle downloader, cleaner and synchronizer**
-> Baixador, higienizador e sincronizador automático de legendas
+> Baixador e sincronizador automático de legendas
 
 ---
 

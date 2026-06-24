@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import sys
 import time
 import logging
@@ -60,14 +61,33 @@ APP_NAME      = "Sub-Tools v1.4"
 APP_TITLE     = "Sub-Tools"
 VIDEO_EXTS    = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".m4v", ".ts"}
 REQUEST_DELAY = 1.5
-ENV_PATH      = Path(__file__).parent / ".env"
+
+# ── Runtime directory resolution ─────────────────────────────────────────────
+# With PyInstaller --onefile, Path(__file__).parent points to a hidden temp
+# extraction folder (sys._MEIPASS), NOT to the folder where the .exe lives.
+# We need sys.executable for everything that must sit beside the executable
+# (alass-windows64/, .env, etc.) and sys._MEIPASS only for files that were
+# bundled *inside* the package (e.g. the embedded .ico).
+def _runtime_dir() -> Path:
+    """
+    Returns the directory that contains the running executable (frozen mode)
+    or the script file (development mode).
+    Use this for resolving paths to external files like .env and alass/.
+    """
+    if getattr(sys, "frozen", False):
+        # Compiled with PyInstaller: sys.executable is the .exe path
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+_SCRIPT_DIR = _runtime_dir()
+
+ENV_PATH = _SCRIPT_DIR / ".env"
 
 # Log file backup delimiters for undo-clean feature
 _BACKUP_START = "<<ORIGINAL_BACKUP_START>>"
 _BACKUP_END   = "<<ORIGINAL_BACKUP_END>>"
 
-# Alass executable search paths (relative to script location)
-_SCRIPT_DIR = Path(__file__).parent
+# Alass executable search paths — resolved relative to the .exe / script
 ALASS_CANDIDATES: list[Path] = [
     _SCRIPT_DIR / "alass-windows64" / "alass.bat",
     _SCRIPT_DIR / "alass-windows64" / "alass.exe",
@@ -83,22 +103,24 @@ DEFAULT_AD_KEYWORDS: list[str] = [
     "propaganda", "anúncio", "subtitles", "advertise",
 ]
 
+# Only BCP-47 codes are accepted by the OpenSubtitles v2 REST API.
+# 3-letter ISO 639-2 codes (e.g. "pob", "eng", "spa") are NOT supported.
 LANGUAGES: dict[str, tuple[str, list[str]]] = {
-    "Portuguese Brazilian (pt-br)": ("pt-br",  ["pob", "pt"]),
-    "Portuguese (pt)":              ("pt",      ["por"]),
-    "English (en)":                 ("en",      ["eng"]),
-    "Spanish (es)":                 ("es",      ["spa"]),
-    "French (fr)":                  ("fr",      ["fre"]),
-    "German (de)":                  ("de",      ["ger"]),
-    "Italian (it)":                 ("it",      ["ita"]),
-    "Japanese (ja)":                ("ja",      ["jpn"]),
-    "Korean (ko)":                  ("ko",      ["kor"]),
-    "Chinese Simplified (zh-cn)":   ("zh-cn",   ["chi", "zho"]),
-    "Arabic (ar)":                  ("ar",      ["ara"]),
-    "Russian (ru)":                 ("ru",      ["rus"]),
-    "Dutch (nl)":                   ("nl",      ["dut"]),
-    "Polish (pl)":                  ("pl",      ["pol"]),
-    "Turkish (tr)":                 ("tr",      ["tur"]),
+    "Portuguese Brazilian (pt-br)": ("pt-br", []),
+    "Portuguese (pt)":              ("pt-pt", []),
+    "English (en)":                 ("en",    []),
+    "Spanish (es)":                 ("es",    []),
+    "French (fr)":                  ("fr",    []),
+    "German (de)":                  ("de",    []),
+    "Italian (it)":                 ("it",    []),
+    "Japanese (ja)":                ("ja",    []),
+    "Korean (ko)":                  ("ko",    []),
+    "Chinese Simplified (zh-cn)":   ("zh-cn", ["zh"]),
+    "Arabic (ar)":                  ("ar",    []),
+    "Russian (ru)":                 ("ru",    []),
+    "Dutch (nl)":                   ("nl",    []),
+    "Polish (pl)":                  ("pl",    []),
+    "Turkish (tr)":                 ("tr",    []),
 }
 
 DEFAULT_LANG_LABEL = "Portuguese Brazilian (pt-br)"
@@ -130,6 +152,31 @@ _TAG_RE = re.compile(r"<[^>]+>", re.IGNORECASE)
 _TIMESTAMP_RE = re.compile(
     r"^\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,\.]\d{3}",
     re.MULTILINE,
+)
+
+# Release-tag noise to strip when building a clean query for OpenSubtitles
+_JUNK_TAGS_RE = re.compile(
+    r"\b("
+    r"2160p|4k|uhd|1080p|720p|480p|360p"
+    r"|x26[45]|h26[45]|hevc|avc|xvid|divx"
+    r"|web[.-]?dl|webrip|bluray|bdrip|brrip|dvdrip|hdtv"
+    r"|amzn|dsnp|nf|hbo|hulu|atvp|pcok"
+    r"|aac|ac3|dd5?\.?1|dts|atmos|dolby|truehd|flac"
+    r"|10bit|hdr10?|sdr|hlg|dv"
+    r"|extended|theatrical|remastered|proper|repack|unrated|limited"
+    r"|dual[.-]?audio|multi[.-]?audio|dubbed|subbed"
+    r"|yify|yts|rarbg|ettv|eztv"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Episode markers: S01E05  s1e5  (also matches S01E05-E06 — takes first episode)
+_EPISODE_SE_RE = re.compile(
+    r"[Ss](?P<season>\d{1,2})[Ee](?P<episode>\d{1,2})"
+)
+# Alternative marker: 01x05  1x05
+_EPISODE_X_RE = re.compile(
+    r"(?:^|[.\-_\s])(?P<season>\d{1,2})[xX](?P<episode>\d{2})(?:[.\-_\s]|$)"
 )
 
 # ─── Queue log handler ────────────────────────────────────────────────────────
@@ -186,7 +233,7 @@ def _ensure_env_file() -> None:
     if not ENV_PATH.exists():
         ENV_PATH.write_text(
             "MY_API_KEY=\nMY_USERNAME=\nMY_PASSWORD=\n"
-            "MY_LANGUAGE=\nAD_KEYWORDS_LIST=\nSKIP_EXISTING=1\nAUTO_SYNC=0\n",
+            "MY_LANGUAGE=\nAD_KEYWORDS_LIST=\nSKIP_EXISTING=1\n",
             encoding="utf-8",
         )
 
@@ -240,12 +287,6 @@ def save_skip_existing(value: bool) -> None:
     save_env_value("SKIP_EXISTING", "1" if value else "0")
 
 
-def load_auto_sync() -> bool:
-    return load_env_values().get("AUTO_SYNC", "0").strip() == "1"
-
-
-def save_auto_sync(value: bool) -> None:
-    save_env_value("AUTO_SYNC", "1" if value else "0")
 
 
 # ─── SRT sanitization ─────────────────────────────────────────────────────────
@@ -543,9 +584,157 @@ def find_video_files(folder: Path) -> list[Path]:
                   if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
 
 
-def search_subtitle(client: OpenSubtitles, video: Path, language: str):
-    response = client.search(query=video.stem, languages=language)
-    return response.data[0] if (response and response.data) else None
+# ─── Smart search helpers ────────────────────────────────────────────────────
+
+def _compute_movie_hash(path: Path) -> str | None:
+    """
+    Compute the OpenSubtitles MovieHash (64-bit checksum of file size +
+    first/last 65536 bytes interpreted as little-endian 64-bit integers).
+    Returns a 16-character hex string, or None if the file is too small.
+    """
+    try:
+        file_size = path.stat().st_size
+        chunk_size = 65536
+        if file_size < chunk_size * 2:
+            return None
+        hash_val = file_size
+        with path.open("rb") as f:
+            for chunk in (f.read(chunk_size),):
+                for i in range(0, len(chunk), 8):
+                    (val,) = struct.unpack_from("<q", chunk, i)
+                    hash_val = (hash_val + val) & 0xFFFFFFFFFFFFFFFF
+            f.seek(-chunk_size, 2)
+            for chunk in (f.read(chunk_size),):
+                for i in range(0, len(chunk), 8):
+                    (val,) = struct.unpack_from("<q", chunk, i)
+                    hash_val = (hash_val + val) & 0xFFFFFFFFFFFFFFFF
+        return f"{hash_val:016x}"
+    except (OSError, struct.error):
+        return None
+
+
+def _clean_video_name(stem: str) -> str:
+    """Strip release tags and normalize separators for a plain text query."""
+    name = stem
+    # Drop episode marker and everything after it so 'Show.S01E01.1080p' → 'Show'
+    m = _EPISODE_SE_RE.search(name)
+    if not m:
+        m = _EPISODE_X_RE.search(name)
+    if m:
+        name = name[:m.start()]
+    name = _JUNK_TAGS_RE.sub(" ", name)
+    name = re.sub(r"[.\-_]+", " ", name)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    return name
+
+
+def _parse_episode_info(stem: str) -> tuple[str, int, int] | None:
+    """Extract (show_name, season, episode) from a filename stem, or None."""
+    m = _EPISODE_SE_RE.search(stem)
+    if m:
+        show_part = stem[:m.start()]
+        season    = int(m.group("season"))
+        episode   = int(m.group("episode"))
+    else:
+        m = _EPISODE_X_RE.search(stem)
+        if not m:
+            return None
+        show_part = stem[:m.start()]
+        season    = int(m.group("season"))
+        episode   = int(m.group("episode"))
+
+    show = re.sub(r"[.\-_]+", " ", show_part)
+    show = _JUNK_TAGS_RE.sub(" ", show)
+    show = re.sub(r"\s{2,}", " ", show).strip()
+    return (show, season, episode) if show else None
+
+
+def search_subtitle_with_fallback(
+    client: OpenSubtitles,
+    video: Path,
+    language: str,
+    log: logging.Logger,
+    stop_event: threading.Event,
+) -> tuple[object | None, str]:
+    """
+    3-step subtitle search with automatic fallback.
+
+    Step 1 — MovieHash  : exact fingerprint match (most accurate).
+    Step 2 — Clean name : filename stripped of release tags.
+    Step 3 — Episode    : structured season/episode query (TV series).
+
+    Returns (result_object, method_label) or (None, "").
+    """
+
+    def _safe_search(**kwargs) -> object | None:
+        """Wrapper with 429 rate-limit retry and quota-exhaustion detection."""
+        for attempt in range(2):
+            try:
+                resp = client.search(**kwargs)
+                return resp.data[0] if (resp and resp.data) else None
+            except OpenSubtitlesException as exc:
+                err = str(exc).lower()
+                if "429" in err or "too many" in err:
+                    if attempt == 0:
+                        log.warning("Rate-limit hit. Waiting 60 s…")
+                        for _ in range(60):
+                            if stop_event.is_set():
+                                return None
+                            time.sleep(1)
+                        continue  # retry once
+                    log.error("Error     : Persistent rate-limit. Skipping search.")
+                    return None
+                elif "406" in err or "quota" in err:
+                    log.error("Error     : Download quota exhausted. Stopping.")
+                    stop_event.set()
+                    return None
+                else:
+                    raise
+        return None
+
+    # ── Step 1: Hash ────────────────────────────────────────────────────
+    log.info("Search    : [1/3] Hash — '%s'…", video.name)
+    movie_hash = _compute_movie_hash(video)
+    if movie_hash:
+        result = _safe_search(moviehash=movie_hash, languages=language)
+        if result:
+            return result, "hash match"
+        if stop_event.is_set():
+            return None, ""
+    else:
+        log.info("Search    : [1/3] File too small for hash — skipping.")
+
+    time.sleep(REQUEST_DELAY)
+
+    # ── Step 2: Clean name query ─────────────────────────────────────────
+    clean = _clean_video_name(video.stem)
+    log.info("Search    : [2/3] Clean-name — '%s'…", clean)
+    result = _safe_search(query=clean, languages=language)
+    if result:
+        return result, f"clean name ('{clean}')"
+    if stop_event.is_set():
+        return None, ""
+
+    time.sleep(REQUEST_DELAY)
+
+    # ── Step 3: Structured episode query ─────────────────────────────────
+    parsed = _parse_episode_info(video.stem)
+    if parsed:
+        show, season, episode = parsed
+        log.info("Search    : [3/3] Episode — '%s' S%02dE%02d…",
+                 show, season, episode)
+        result = _safe_search(
+            query=show,
+            season_number=season,
+            episode_number=episode,
+            languages=language,
+        )
+        if result:
+            return result, f"episode ('{show}' S{season:02d}E{episode:02d})"
+    else:
+        log.info("Search    : [3/3] No episode pattern detected — skipping.")
+
+    return None, ""
 
 
 def download_subtitle(client: OpenSubtitles, result, dest_path: Path) -> None:
@@ -558,14 +747,10 @@ def process_video(
     video: Path,
     lang_codes: list[str],
     skip_existing: bool,
-    auto_sync: bool,
-    alass_bin: Path | None,
-    ad_keywords: list[str],
-    confirm_bridge: ConfirmBridge | None,
     log: logging.Logger,
     stop_event: threading.Event,
 ) -> None:
-    """Download subtitle for one video, then optionally clean + sync."""
+    """Download subtitle for one video."""
     if stop_event.is_set():
         return
 
@@ -574,41 +759,37 @@ def process_video(
         log.info("Skipped   : Subtitle already exists → %s", base_srt.name)
         return
 
-    # ── Search ──────────────────────────────────────────────────────────────
-    result = None
+    # ── Search (3-step smart fallback) ──────────────────────────────────────
+    result       = None
     used_language = None
+
     for language in lang_codes:
         if stop_event.is_set():
             return
         try:
-            result = search_subtitle(client, video, language)
+            result, method = search_subtitle_with_fallback(
+                client, video, language, log, stop_event
+            )
         except OpenSubtitlesException as exc:
-            err = str(exc).lower()
-            if "429" in err or "too many" in err:
-                log.warning("Rate-limit hit. Waiting 60s…")
-                for _ in range(60):
-                    if stop_event.is_set():
-                        return
-                    time.sleep(1)
-                try:
-                    result = search_subtitle(client, video, language)
-                except OpenSubtitlesException:
-                    log.error("Error     : Persistent rate-limit for '%s'. Skipping.", video.name)
-                    return
-            elif "406" in err or "quota" in err:
-                log.error("Error     : Download quota exhausted. Stopping.")
-                stop_event.set()
-                return
-            else:
-                log.warning("Warning   : Search error '%s' (%s): %s", video.name, language, exc)
-                continue
+            log.warning("Warning   : Search error for '%s' (%s): %s",
+                        video.name, language, exc)
+            continue
+        except Exception as exc:
+            log.warning("Warning   : Unexpected search error for '%s': %s",
+                        video.name, exc)
+            continue
+
         if result:
             used_language = language
+            log.info("Found     : Subtitle located via %s.", method)
             break
-        time.sleep(REQUEST_DELAY)
+
+        if stop_event.is_set():
+            return
 
     if not result:
-        log.warning("Not found : No subtitle found for → %s", video.name)
+        log.warning("Not found : No subtitle found for '%s' (tried hash, clean name and episode query).",
+                    video.name)
         return
 
     # ── Destination path ─────────────────────────────────────────────────────
@@ -646,29 +827,11 @@ def process_video(
         log.error("Error     : Unexpected error for '%s': %s", video.name, exc)
         return
 
-    # ── Auto-sync: Clean → Alass ─────────────────────────────────────────────
-    if auto_sync and alass_bin and not stop_event.is_set():
-        log.info("Auto-sync : Cleaning '%s' before sync…", srt_path.name)
-        sanitize_srt(srt_path, ad_keywords, log, stop_event, confirm_bridge)
-
-        if stop_event.is_set():
-            return
-
-        # srt_path might have been modified in-place by sanitize_srt;
-        # now check it still exists (sanitize always keeps the file)
-        if srt_path.exists():
-            log.info("Auto-sync : Synchronizing '%s' with Alass…", video.name)
-            run_alass_sync(alass_bin, video, srt_path, log, stop_event)
-
 
 def run_download(
     folder: Path,
     lang_codes: list[str],
     skip_existing: bool,
-    auto_sync: bool,
-    alass_bin: Path | None,
-    ad_keywords: list[str],
-    confirm_bridge: ConfirmBridge | None,
     log: logging.Logger,
     stop_event: threading.Event,
 ) -> None:
@@ -695,9 +858,7 @@ def run_download(
                 return
             log.info("[%d/%d] Processing: %s", idx, len(videos), video.name)
             try:
-                process_video(client, video, lang_codes, skip_existing,
-                              auto_sync, alass_bin, ad_keywords,
-                              confirm_bridge, log, stop_event)
+                process_video(client, video, lang_codes, skip_existing, log, stop_event)
             except Exception as exc:
                 log.error("Error     : '%s': %s", video.name, exc)
             if idx < len(videos) and not stop_event.is_set():
@@ -1087,12 +1248,21 @@ class App(tk.Tk):
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
 
+        # Set window icon — works both from source and from a PyInstaller bundle
+        try:
+            # When compiled with PyInstaller, data files land in sys._MEIPASS
+            base = Path(getattr(sys, "_MEIPASS", _SCRIPT_DIR))
+            ico  = base / "sub-tools.ico"
+            if ico.exists():
+                self.iconbitmap(str(ico))
+        except Exception:
+            pass  # icon is cosmetic — never crash on failure
+
         # Shared state
         self._folder_var      = tk.StringVar(value="")
         self._status_var      = tk.StringVar(value="Ready")
         self._lang_var        = tk.StringVar(value=load_preferred_language())
         self._skip_var        = tk.BooleanVar(value=load_skip_existing())
-        self._auto_sync_var   = tk.BooleanVar(value=load_auto_sync())
         self._ad_keywords     = load_ad_keywords()
         self._alass_bin       = find_alass()
 
@@ -1229,7 +1399,7 @@ class App(tk.Tk):
         self._lang_combo.pack(side="left", ipady=6)
         self._lang_combo.bind("<<ComboboxSelected>>", self._on_language_changed)
 
-        # Options: skip + auto-sync
+        # Options: skip existing
         opts = tk.Frame(f2r, bg=CLR["bg"])
         opts.pack(side="left", padx=(16, 0))
 
@@ -1240,23 +1410,6 @@ class App(tk.Tk):
             activebackground=CLR["bg"], selectcolor=CLR["surface2"],
             relief="flat", bd=0, cursor="hand2")
         self._chk_skip.pack(anchor="w")
-
-        self._chk_auto_sync = tk.Checkbutton(
-            opts,
-            text="Auto-sync with Alass after download  (Clean → Sync)",
-            variable=self._auto_sync_var,
-            command=self._on_auto_sync_changed,
-            font=("Segoe UI", 9), fg=CLR["text_dim"], bg=CLR["bg"],
-            activebackground=CLR["bg"], selectcolor=CLR["surface2"],
-            relief="flat", bd=0, cursor="hand2")
-        self._chk_auto_sync.pack(anchor="w")
-
-        # Alass status hint
-        alass_status = "✓ Alass found" if self._alass_bin else "✗ Alass not found — check alass-windows64 folder"
-        alass_color  = CLR["success"] if self._alass_bin else CLR["error"]
-        self._alass_hint_dl = tk.Label(opts, text=alass_status,
-                                       font=("Segoe UI", 8), fg=alass_color, bg=CLR["bg"])
-        self._alass_hint_dl.pack(anchor="w")
 
         # Action buttons
         act = tk.Frame(tab, bg=CLR["bg"])
@@ -1491,8 +1644,6 @@ class App(tk.Tk):
     def _on_skip_changed(self) -> None:
         save_skip_existing(self._skip_var.get())
 
-    def _on_auto_sync_changed(self) -> None:
-        save_auto_sync(self._auto_sync_var.get())
 
     def _get_folder(self) -> Path | None:
         s = self._folder_var.get().strip()
@@ -1512,38 +1663,24 @@ class App(tk.Tk):
         if folder is None:
             return
         label = self._lang_var.get()
-        primary, fallbacks = LANGUAGES.get(label, ("pt-br", ["pob", "pt"]))
+        primary, fallbacks = LANGUAGES.get(label, ("pt-br", ["pt"]))
         lang_codes    = [primary] + fallbacks
         skip_existing = self._skip_var.get()
-        auto_sync     = self._auto_sync_var.get()
-        alass_bin     = self._alass_bin
 
-        if auto_sync and not alass_bin:
-            if not messagebox.askyesno(
-                "Alass Not Found",
-                "Auto-sync is enabled but Alass was not found.\n\n"
-                "Continue download without syncing?",
-            ):
-                return
-            auto_sync = False
-
-        self._confirm_bridge = ConfirmBridge() if auto_sync else None
+        self._confirm_bridge = None
         self._stop_event.clear()
         self._set_running(True)
 
         self._append_log("ACCENT", "═" * 52)
-        self._append_log("ACCENT", f"  Download & Clean  —  {datetime.now().strftime('%m/%d/%Y %H:%M:%S')}")
+        self._append_log("ACCENT", f"  Download Subtitles  —  {datetime.now().strftime('%m/%d/%Y %H:%M:%S')}")
         self._append_log("ACCENT", f"  Folder      : {folder}")
         self._append_log("ACCENT", f"  Language    : {label}")
         self._append_log("ACCENT", f"  Skip exist  : {'Yes' if skip_existing else 'No (add lang suffix)'}")
-        self._append_log("ACCENT", f"  Auto-sync   : {'Yes — Clean + Alass' if auto_sync else 'No'}")
         self._append_log("ACCENT", "═" * 52)
 
         self._worker = threading.Thread(
             target=self._run_worker,
-            args=(run_download, folder, lang_codes, skip_existing,
-                  auto_sync, alass_bin, list(self._ad_keywords),
-                  self._confirm_bridge),
+            args=(run_download, folder, lang_codes, skip_existing),
             daemon=True,
         )
         self._worker.start()
@@ -1696,7 +1833,6 @@ class App(tk.Tk):
             self._btn_stop_sync.config(state="normal")
             self._lang_combo.config(state="disabled")
             self._chk_skip.config(state="disabled")
-            self._chk_auto_sync.config(state="disabled")
             self._progress_dl.start(12)
             self._progress_sync.start(12)
             self._status_var.set("Processing…")
@@ -1710,7 +1846,6 @@ class App(tk.Tk):
             self._btn_stop_sync.config(state="disabled")
             self._lang_combo.config(state="readonly")
             self._chk_skip.config(state="normal")
-            self._chk_auto_sync.config(state="normal")
             self._progress_dl.stop()
             self._progress_sync.stop()
             self._status_var.set("Done" if not self._stop_event.is_set() else "Cancelled")

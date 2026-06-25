@@ -516,13 +516,19 @@ def run_alass_sync(
     srt_path: Path,
     log: logging.Logger,
     stop_event: threading.Event,
+    split_penalty: float | None = None,
 ) -> tuple[bool, str]:
     """
     Synchronizes a subtitle file against a video using Alass.
 
     Steps:
       1. Rename srt_path  →  <stem>.ori.srt   (preserves original)
-      2. Run: alass video.mkv <stem>.ori.srt  video_stem.srt
+      2. Run: alass [--split-penalty N] video.mkv <stem>.ori.srt  video_stem.srt
+
+    Args:
+        split_penalty: When provided, passes ``--split-penalty <value>`` to Alass.
+                       Lower values (0.05–0.15) suit TV shows with recaps/cuts.
+                       Higher values (0.2–0.5) treat the file as one continuous block.
 
     Returns:
         (True, output_path_str)  on success
@@ -540,7 +546,11 @@ def run_alass_sync(
     except OSError as exc:
         return False, f"Could not rename subtitle: {exc}"
 
-    cmd = [str(alass_bin), str(video), str(ori_srt), str(output_srt)]
+    cmd = [str(alass_bin)]
+    if split_penalty is not None:
+        cmd += ["--split-penalty", f"{split_penalty:.2f}"]
+    cmd += [str(video), str(ori_srt), str(output_srt)]
+
     log.info("Alass     : Synchronizing '%s'…", video.name)
     log.info("Alass     : %s", " ".join(f'"{a}"' for a in cmd))
 
@@ -1240,10 +1250,10 @@ class App(tk.Tk):
         self.title(APP_TITLE)
         self.configure(bg=CLR["bg"])
         self.resizable(True, True)
-        self.minsize(780, 600)
+        self.minsize(780, 720)
 
         self.update_idletasks()
-        w, h = 900, 680
+        w, h = 900, 830
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
@@ -1269,6 +1279,8 @@ class App(tk.Tk):
         # Sync tab state
         self._sync_video_var  = tk.StringVar(value="")
         self._sync_srt_var    = tk.StringVar(value="")
+        self._adv_sync_var    = tk.BooleanVar(value=False)
+        self._split_penalty_var = tk.DoubleVar(value=0.1)
 
         self._log_queue: queue.Queue[logging.LogRecord] = queue.Queue()
         self._stop_event      = threading.Event()
@@ -1351,6 +1363,10 @@ class App(tk.Tk):
 
         self._build_tab_download(self._tab_dl)
         self._build_tab_sync(self._tab_sync)
+
+        # Fix notebook height so it never grows beyond the tallest tab,
+        # leaving the log area a stable, generous space below.
+        self._notebook.configure(height=420)
 
         # ── Shared log frame ──────────────────────────────────────────────────
         self._build_log_frame()
@@ -1495,6 +1511,68 @@ class App(tk.Tk):
         self._rename_preview.pack(anchor="w", padx=20, pady=(6, 0))
         self._sync_video_var.trace_add("write", self._update_rename_preview)
         self._sync_srt_var.trace_add("write",   self._update_rename_preview)
+
+        # ── Advanced sync options (Split Penalty) ─────────────────────────────
+        adv_frame = tk.Frame(tab, bg=CLR["surface"], relief="flat")
+        adv_frame.pack(fill="x", padx=20, pady=(14, 0))
+
+        # Card inner padding
+        adv_inner = tk.Frame(adv_frame, bg=CLR["surface"])
+        adv_inner.pack(fill="x", padx=14, pady=10)
+
+        # Checkbox
+        self._chk_adv_sync = tk.Checkbutton(
+            adv_inner,
+            text="Enable advanced sync for Series  (Recaps / Scene Cuts)",
+            variable=self._adv_sync_var,
+            command=self._on_adv_sync_toggled,
+            font=("Segoe UI", 9, "bold"), fg=CLR["accent2"], bg=CLR["surface"],
+            activebackground=CLR["surface"], selectcolor=CLR["surface2"],
+            relief="flat", bd=0, cursor="hand2")
+        self._chk_adv_sync.pack(anchor="w")
+
+        # Scale row
+        scale_row = tk.Frame(adv_inner, bg=CLR["surface"])
+        scale_row.pack(fill="x", pady=(8, 0))
+
+        tk.Label(scale_row, text="Split Penalty:",
+                 font=("Segoe UI", 9), fg=CLR["text_dim"],
+                 bg=CLR["surface"]).pack(side="left")
+
+        self._split_val_label = tk.Label(
+            scale_row, textvariable=self._split_penalty_var,
+            font=("Segoe UI", 9, "bold"), fg=CLR["accent2"],
+            bg=CLR["surface"], width=4)
+        self._split_val_label.pack(side="left", padx=(4, 0))
+
+        self._split_scale = tk.Scale(
+            scale_row,
+            variable=self._split_penalty_var,
+            from_=0.05, to=0.5, resolution=0.05,
+            orient="horizontal", length=340,
+            bg=CLR["surface"], fg=CLR["text_dim"],
+            activebackground=CLR["accent2"],
+            highlightthickness=0, sliderrelief="flat",
+            troughcolor=CLR["surface2"],
+            showvalue=False,
+            state="disabled",
+        )
+        self._split_scale.pack(side="left", padx=(10, 0))
+
+        # Guidance text
+        self._split_guidance = tk.Label(
+            adv_inner,
+            text=(
+                "Guidance:  Lower values (0.05 – 0.15) are ideal for TV shows with "
+                "\"Previously on\" recaps or commercial-break cuts.  "
+                "Higher values (0.2 – 0.5) treat the subtitle as one continuous block, "
+                "best for regular movies."
+            ),
+            font=("Segoe UI", 8), fg=CLR["text_dim"],
+            bg=CLR["surface"], justify="left", wraplength=700,
+            state="disabled",
+        )
+        self._split_guidance.pack(anchor="w", pady=(8, 0))
 
         # Sync button row
         sync_act = tk.Frame(tab, bg=CLR["bg"])
@@ -1644,6 +1722,14 @@ class App(tk.Tk):
     def _on_skip_changed(self) -> None:
         save_skip_existing(self._skip_var.get())
 
+    def _on_adv_sync_toggled(self) -> None:
+        """Enable or disable the split-penalty scale based on the checkbox state."""
+        enabled = self._adv_sync_var.get()
+        state = "normal" if enabled else "disabled"
+        self._split_scale.config(state=state)
+        self._split_guidance.config(
+            fg=CLR["text"] if enabled else CLR["text_dim"]
+        )
 
     def _get_folder(self) -> Path | None:
         s = self._folder_var.get().strip()
@@ -1751,6 +1837,9 @@ class App(tk.Tk):
                                  "Place it in the alass-windows64 folder.")
             return
 
+        adv_sync     = self._adv_sync_var.get()
+        split_penalty = round(self._split_penalty_var.get(), 2) if adv_sync else None
+
         self._confirm_bridge = None
         self._stop_event.clear()
         self._set_running(True)
@@ -1763,19 +1852,25 @@ class App(tk.Tk):
         self._append_log("ACCENT2", f"  Video    : {video.name}")
         self._append_log("ACCENT2", f"  Subtitle : {srt.name}  →  {ori_name}")
         self._append_log("ACCENT2", f"  Output   : {out_name}")
+        if split_penalty is not None:
+            self._append_log("ACCENT2", f"  Mode     : Advanced Series Sync  (split-penalty={split_penalty:.2f})")
+        else:
+            self._append_log("ACCENT2",  "  Mode     : Standard Sync")
         self._append_log("ACCENT2", "═" * 52)
 
         alass_bin = self._alass_bin
         self._worker = threading.Thread(
             target=self._sync_thread,
-            args=(video, srt, alass_bin),
+            args=(video, srt, alass_bin, split_penalty),
             daemon=True,
         )
         self._worker.start()
 
-    def _sync_thread(self, video: Path, srt: Path, alass_bin: Path) -> None:
+    def _sync_thread(self, video: Path, srt: Path, alass_bin: Path,
+                     split_penalty: float | None) -> None:
         success, detail = run_alass_sync(alass_bin, video, srt,
-                                         self._logger, self._stop_event)
+                                         self._logger, self._stop_event,
+                                         split_penalty=split_penalty)
         self.after(0, lambda: self._on_sync_done(success, video, detail))
         self.after(0, self._on_done)
 
